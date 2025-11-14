@@ -22,5 +22,5 @@
 
 int calc_score(const char* operation, const char* buf, size_t size);
 int monitor_operation(const char* operation, const char* buf, size_t size, pid_t current_pid);
-static int check_frequency_and_alert(pid_t current_pid)
+int check_frequency_and_alert(pid_t current_pid);
 #endif

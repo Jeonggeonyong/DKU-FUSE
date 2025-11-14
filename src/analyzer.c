@@ -48,7 +48,7 @@ int calc_score(const char* operation, const char* buf, size_t size) {
  * @brief 1초마다 빈도를 검사하고, 누적 점수로 최종 악성 여부 판단
  * @param current_pid 현재 PID
  */
-static int check_frequency_and_alert(pid_t current_pid) {
+int check_frequency_and_alert(pid_t current_pid) {
     time_t current_time = time(NULL);
     int is_malicious = 0; // 1: 악성
 
