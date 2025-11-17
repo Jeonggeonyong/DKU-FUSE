@@ -1,7 +1,4 @@
 #define FUSE_USE_VERSION 35
-// 추가 define
-#define MAX_TRACKED_PIDS 100 // 최대 추적 PID 개수
-#define KILL_THRESHOLD 80 // Malice Score 강제 종료 임계값 ((임시))
 
 #include <fuse3/fuse.h>
 #include <stdio.h>
@@ -17,21 +14,13 @@
 #include <signal.h>
 // 추가 include 
 #include <sys/types.h>
-#include "analyzer.h" 
+#include "myFuse.h"
 
 static int base_fd = -1;
 
 // ===========================================================================
 //                          추가 전역 변수 & 구조체 정의
 // ===========================================================================
-
-// PID score, 동작 기록 구조체
-typedef struct {
-    pid_t pid; 
-    int malice_score; // 벌점    
-    time_t last_write_time; // 마지막 쓰기 연산 시간 
-    char proc_name[32]; //  프로세스 이름 저장
-} ProcessMonitorEntry;
 
 // 전역 Score 테이블
 ProcessMonitorEntry g_score_table[MAX_TRACKED_PIDS];
@@ -88,7 +77,11 @@ ProcessMonitorEntry* find_or_create_score_entry(pid_t pid) {
         // 새로운 엔트리 초기화
         new_entry->pid = pid;
         new_entry->malice_score = 0;
-        new_entry->last_write_time = time(NULL);
+        new_entry->last_write_time = 0; // 처음엔 0으로 초기화
+        new_entry->start_time = 0;      // 0으로 초기화 (첫 호출 시 설정됨)
+        new_entry->write_count = 0;
+        new_entry->unlink_count = 0;
+        new_entry->rename_count = 0;
         g_proc_cnt++; // 추적 중인 프로세스 수 증가
         return new_entry;
     }
@@ -128,6 +121,119 @@ void reset_malice_score(pid_t pid) {
     if (entry) {
         entry->malice_score = 0;
     }
+}
+
+/**
+ * @brief 연산 내용에 따라 1회 점수를 계산 (엔트로피 비교 포함)
+ * @param operation 연산
+ * @param buf 사용자 쓰기 입력 버퍼
+ * @param size 버퍼 크기
+ * @param entropy_before 쓰기 전 원본 데이터의 엔트로피
+ */
+static int calc_score(const char* operation, const char* buf, size_t size, double entropy_before) {
+    int score_to_add = 0;
+
+    if (strcmp(operation, "WRITE") == 0) {
+        score_to_add += WEIGHT_WRITE; // 1점 추가
+
+        if (buf != NULL && size > 0) {
+            double entropy_after = calculate_entropy(buf, size); // 쓰기 후 엔트로피
+            
+            // 엔트로피가 임계값을 넘고, 이전보다 '증가'했을 때
+            if (entropy_after > ENTROPY_THRESHOLD && entropy_after > entropy_before) {
+                score_to_add += WEIGHT_HIGH_ENTROPY; // 5점 추가
+                fprintf(stderr, "PID %d: High entropy detected (Before: %.2f, After: %.2f)\n", 
+                        fuse_get_context()->pid, entropy_before, entropy_after);
+            }
+        }
+    }
+    else if (strcmp(operation, "UNLINK") == 0 || strcmp(operation, "RENAME") == 0) {
+        score_to_add += WEIGHT_MALICIOUS; // 3점 추가
+    }
+    return score_to_add;
+}
+
+/**
+ * @brief 1초마다 빈도를 검사하고, 누적 점수로 최종 악성 여부 판단
+ * @param entry 현재 PID에 해당하는 ProcessMonitorEntry 포인터
+ */
+static int check_frequency_and_alert(ProcessMonitorEntry* entry) {
+    time_t current_time = time(NULL);
+    int is_malicious = 0; // 1: 악성
+
+    if(entry->start_time == 0) { // 첫 호출
+        entry->start_time = current_time;
+        // 첫 호출 시에도 최종 점수 검사는 필요함
+    }
+
+    // 1초가 경과 확인
+    if (current_time - entry->start_time >= TIME_SECONDS) {
+        // 빈도수 검사 및 벌점 부과
+        if (entry->write_count > WRITE_THRESHOLD_PER_1) {
+            entry->malice_score += PENALTY_HIGH_WRITE;
+        }
+        if (entry->unlink_count > UNLINK_THRESHOLD_PER_1) {
+            entry->malice_score += PENALTY_HIGH_UNLINK;
+        }
+        if (entry->rename_count > RENAME_THRESHOLD_PER_1) {
+            entry->malice_score += PENALTY_HIGH_RENAME;
+        }
+
+        // 카운트 리셋
+        entry->write_count = 0;
+        entry->unlink_count = 0;
+        entry->rename_count = 0;
+        // 타이머 리셋
+        entry->start_time = current_time; 
+    }
+
+    // 누적된 총 점수가 임계치를 넘는지 검사 (기존 KILL_THRESHOLD 대신 사용)
+    if (entry->malice_score > FINAL_MALICE_THRESHOLD) {
+        printf("malice detected (PID:%d)\n", entry->pid); 
+        printf("malice score : %d (threshold: %d)\n", entry->malice_score, FINAL_MALICE_THRESHOLD);
+        
+        // 1초가 리셋되기 직전의 카운트를 보여줌
+        printf("현재 1초간 행동 횟수 :(w : %d. U : %d, R:%d)\n", entry->write_count, entry->unlink_count, entry->rename_count);
+
+        is_malicious = 1; // 악성으로 판정
+    }
+    
+    return is_malicious;
+}
+
+/**
+ * @brief 메인 모니터링 함수 (FUSE 훅에서 호출됨)
+ * @param operation 연산
+ * @param buf 사용자 입력 버퍼
+ * @param size 입력 버퍼 크기
+ * @param entropy_before (WRITE용) 쓰기 전 엔트로피
+ */
+static int monitor_operation(const char* operation, const char* buf, size_t size, double entropy_before) {
+    struct fuse_context *context = fuse_get_context();
+    pid_t current_pid = context->pid;
+
+    ProcessMonitorEntry *entry = find_or_create_score_entry(current_pid);
+    if (!entry) {
+        fprintf(stderr, "PID %d: Failed to get score entry (table full?)\n", current_pid);
+        return 0; // 추적 테이블이 가득 차면 방어 실패 (일단 허용)
+    }
+
+    // 1. 개별 연산 점수 계산 및 누적
+    int content_score = calc_score(operation, buf, size, entropy_before);
+    entry->malice_score += content_score;
+
+    // 2. 빈도수 카운트 누적
+    if (strcmp(operation, "WRITE") == 0) {
+        entry->write_count++;
+        entry->last_write_time = time(NULL); // 마지막 쓰기 시간 갱신
+    } else if (strcmp(operation, "UNLINK") == 0) {
+        entry->unlink_count++;
+    } else if (strcmp(operation, "RENAME") == 0) {
+        entry->rename_count++;
+    }
+
+    // 3. 1초 윈도우 검사 및 최종 악성 여부 반환
+    return check_frequency_and_alert(entry);
 }
 
 // ===========================================================================
@@ -207,12 +313,12 @@ static int myfs_readdir(const char *path, void *buf, fuse_fill_dir_t filler, off
 // open 함수 구현
 static int myfs_open(const char *path, struct fuse_file_info *fi) {
     // 쓰기 검사 구현
-    if ((fi->flags & O_WRONLY) || (fi->flags & O_RDWR)) {
-        // 화이트리스트에 있는지 확인
-        if (!is_writable_whitelisted(path)) {
-            return -EACCES; //없다면 접근 거부
-        }
-    }
+    // if ((fi->flags & O_WRONLY) || (fi->flags & O_RDWR)) {
+    //     // 화이트리스트에 있는지 확인
+    //     if (!is_writable_whitelisted(path)) {
+    //         return -EACCES; //없다면 접근 거부
+    //     }
+    // }
 
     int res;
     char relpath[PATH_MAX];
@@ -229,9 +335,9 @@ static int myfs_open(const char *path, struct fuse_file_info *fi) {
 // create 함수 구현
 static int myfs_create(const char *path, mode_t mode, struct fuse_file_info *fi) {
     // 쓰기(생성) 차단
-    if (!is_writable_whitelisted(path)) {
-        return -EACCES; 
-    }
+    // if (!is_writable_whitelisted(path)) {
+    //     return -EACCES; 
+    // }
 
     int res;
     char relpath[PATH_MAX];
@@ -259,29 +365,35 @@ static int myfs_read(const char *path, char *buf, size_t size, off_t offset, str
 // write 함수 구현
 static int myfs_write(const char *path, const char *buf, size_t size, off_t offset, struct fuse_file_info *fi) {
     // 화이트리스트 체크
-    if (!is_writable_whitelisted(path)) { // 화이트리스트에 없으면 접근 거부
-        return -EACCES; 
+    // if (!is_writable_whitelisted(path)) { // 화이트리스트에 없으면 접근 거부
+    //     return -EACCES; 
+    // }
+    
+    // 1. 원본 데이터 읽기 및 '쓰기 전' 엔트로피 계산
+    char *original_buf = malloc(size);
+    double entropy_before = 0;
+    if (original_buf != NULL) {
+        ssize_t read_bytes = pread(fi->fh, original_buf, size, offset);
+        if (read_bytes > 0) {
+            entropy_before = calculate_entropy(original_buf, read_bytes);
+        }
+        free(original_buf);
+    } else {
+        // 메모리 할당 실패 시, 엔트로피 검사 스킵
+        fprintf(stderr, "Warning: Failed to allocate buffer for entropy check.\n");
     }
+
+    // 2. 통합 모니터링 함수 호출
+    int is_malicious = monitor_operation("WRITE", buf, size, entropy_before);
     
-    // PID 획득
-    struct fuse_context *context = fuse_get_context();
-    pid_t current_pid = context->pid;
-    
-    // score 계산 및 갱신 
-    int added_score = calc_score("WRITE", buf, size);
-    update_malice_score(current_pid, added_score);
-    
-    // 임계값 확인 후 강제 종료 조치
-    if (get_malice_score(current_pid) >= KILL_THRESHOLD) {
-        fprintf(stderr, "Kill ! 'write' 임계값 초과! PID %d 강제 종료\n", current_pid);
+    // 3. 악성 행위 차단
+    if (is_malicious) {
+        fprintf(stderr, "Kill ! 'write' 임계값 초과! PID %d 강제 종료\n", fuse_get_context()->pid);
         
-        // 강제 종료 실행
-        if (kill(current_pid, SIGKILL) == -1) {
+        if (kill(fuse_get_context()->pid, SIGKILL) == -1) {
             fprintf(stderr, "킬 명령어 실패: %s\n", strerror(errno));
         }
-
-        // 쓰기 연산 차단 및 에러 반환
-        return -EIO; 
+        return -EIO; // 쓰기 연산 차단
     }
 
     // 정상 연산 
@@ -300,32 +412,27 @@ static int myfs_release(const char *path, struct fuse_file_info *fi) {
     pid_t current_pid = context->pid;
 
     //파일 닫으면 해당 p의 score초기화 -> why?
-    reset_malice_score(current_pid); 
+    // reset_malice_score(current_pid); 
     return 0;
 }
 
 // unlink 함수 구현 (파일 삭제)
 static int myfs_unlink(const char *path) {
     // 화이트리스트 체크
-    if (!is_writable_whitelisted(path)) {
-        return -EACCES; // 화이트리스트에 없으면 삭제 거부
-    }
+    // if (!is_writable_whitelisted(path)) {
+    //     return -EACCES; // 화이트리스트에 없으면 삭제 거부
+    // }
     
-    // PID 획득
-    struct fuse_context *context = fuse_get_context(); 
-    pid_t current_pid = context->pid;
-    
-    // score 계산 및 갱신
-    int added_score = calc_score("UNLINK", NULL, 0); 
-    update_malice_score(current_pid, added_score); 
-   
-    // 임계값 확인 후 강제 종료 조치
-    if(get_malice_score(current_pid) >= KILL_THRESHOLD) {
-	    fprintf(stderr, "Kill ! 'unlink' 임계값 초과! PID %d 강제종료\n", current_pid);
-	    if(kill(current_pid,SIGKILL) == -1){
-		    fprintf(stderr, " 킬명령어 실패:%s\n", strerror(errno));
-	    }
-	    return -EIO;
+    // 1. 통합 모니터링 함수 호출 (엔트로피 불필요, 0 전달)
+    int is_malicious = monitor_operation("UNLINK", NULL, 0, 0);
+
+    // 2. 악성 행위 차단
+    if (is_malicious) {
+        fprintf(stderr, "Kill ! 'unlink' 임계값 초과! PID %d 강제종료\n", fuse_get_context()->pid);
+        if(kill(fuse_get_context()->pid, SIGKILL) == -1){
+            fprintf(stderr, " 킬명령어 실패:%s\n", strerror(errno));
+        }
+        return -EIO; // 삭제 연산 차단
     }
 
     // 정상 연산
@@ -369,25 +476,20 @@ static int myfs_rmdir(const char *path) {
 // rename 함수 구현 (파일/디렉터리 이름 변경)
 static int myfs_rename(const char *from, const char *to, unsigned int flags) {
     // to 경로에 대한 화이트리스트 체크 (화이트리스트 파일로만 이름 변경 허용)
-    if (!is_writable_whitelisted(to)) {
-        return -EACCES; // 목적지 경로가 화이트리스트에 없으면 거부
-    }
+    // if (!is_writable_whitelisted(to)) {
+    //     return -EACCES; // 목적지 경로가 화이트리스트에 없으면 거부
+    // }
     
-    // PID 획득
-    struct fuse_context *context = fuse_get_context(); 
-    pid_t current_pid = context->pid;
+    // 1. 통합 모니터링 함수 호출 (엔트로피 불필요, 0 전달)
+    int is_malicious = monitor_operation("RENAME", NULL, 0, 0);
 
-    // score 계산 및 갱신
-    int added_score = calc_score("RENAME", NULL, 0); 
-    update_malice_score(current_pid, added_score); 
-
-    // 임계값 확인 후 강제 종료 조치
-    if(get_malice_score(current_pid) >= KILL_THRESHOLD) {
-            fprintf(stderr, "Kill ! 'rename' 임계값 초과! PID %d 강제종료\n", current_pid);
-            if(kill(current_pid,SIGKILL) == -1){
-                    fprintf(stderr, " 킬명령어 실패:%s\n", strerror(errno));
-            }
-            return -EIO;
+    // 2. 악성 행위 차단
+    if (is_malicious) {
+        fprintf(stderr, "Kill ! 'rename' 임계값 초과! PID %d 강제종료\n", fuse_get_context()->pid);
+        if(kill(fuse_get_context()->pid, SIGKILL) == -1){
+            fprintf(stderr, " 킬명령어 실패:%s\n", strerror(errno));
+        }
+        return -EIO; // 이름 변경 연산 차단
     }
 
     // 정상 연산
