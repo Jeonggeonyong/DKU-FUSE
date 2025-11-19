@@ -1,4 +1,5 @@
 #define FUSE_USE_VERSION 35
+#define _GNU_SOURCE
 
 #include <fuse3/fuse.h>
 #include <stdio.h>
@@ -12,15 +13,41 @@
 #include <limits.h>
 #include <sys/time.h>
 #include <signal.h>
+#include <pthread.h> // 뮤텍스 사용
 // 추가 include 
 #include <sys/types.h>
 #include "myFuse.h"
-
-static int base_fd = -1;
+#include "entropy.h"
+#include "log.h"
 
 // ===========================================================================
 //                          추가 전역 변수 & 구조체 정의
 // ===========================================================================
+
+// 옵션 파싱을 위한 구조체
+struct myfs_config {
+    int log_enabled; // --log 옵션이 들어오면 1이 됨
+};
+static struct myfs_config conf;
+
+// FUSE 옵션 정의 매크로
+#define MYFS_OPT(t, p, v) { t, offsetof(struct myfs_config, p), v }
+
+static const struct fuse_opt myfs_opts[] = {
+    MYFS_OPT("--log", log_enabled, 1), // --log 옵션이 있으면 conf.log_enabled = 1
+    FUSE_OPT_END
+};
+
+static int base_fd = -1;
+
+// 전역 변수 및 뮤텍스
+ProcessMonitorEntry g_score_table[100]; // MAX_TRACKED_PIDS 대신 100 하드코딩 (헤더 의존성 줄임)
+static pthread_mutex_t g_lock = PTHREAD_MUTEX_INITIALIZER; // 통합 락
+
+// --- 허니팟 리스트 ---
+static const char *honeypot_files[] = {
+    "secret.txt"
+};
 
 // 전역 Score 테이블
 ProcessMonitorEntry g_score_table[MAX_TRACKED_PIDS];
@@ -32,14 +59,36 @@ static const char *blacklist[] = {
     NULL // 목록 끝을 표시
 };
 
+/*
+    FUSE 시스템의 규칙은 일반적인 사용에 제약이 생길 정도로 규제를 강하게 하면 안됨.
+    근데 화이트리스트는 아무리 생각해도 이 규칙 안에서는 큰 의미 없는 것 같음. 
+*/
 // 쓰기 전용 화이트리스트 생성(일종의 낚시 파일을 제외한 리스트)
+// 사용 X
 static const char *writable_whitelist[] = {
-    "/text.txt",  //일반적인 파일 지정
+    "text.txt",  //일반적인 파일 지정
     NULL 
 };
 
 // ===========================================================================
-//                                   추가 함수 
+//                                 honeypot 함수 
+// ===========================================================================
+
+static int is_honeypot(const char *path) {
+    for (int i = 0; honeypot_files[i] != NULL; i++) {
+        // 경로 안에 해당 파일명이 포함되어 있는지 확인
+        if (strstr(path, honeypot_files[i]) != NULL) {
+            fprintf(stderr, "[DEBUG] Honeypot DETECTED! Path: %s matched keyword: %s\n", path, honeypot_files[i]);
+            return 1;
+        }
+    }
+    // 디버깅용: 허니팟이 아니라고 판단될 때
+    // fprintf(stderr, "[DEBUG] Not a honeypot: %s\n", path); 
+    return 0;
+}
+
+// ===========================================================================
+//                                   analyze 함수 
 // ===========================================================================
 
 // 해당 파일이 블랙리스트에 포함되는지 확인
@@ -122,6 +171,10 @@ void reset_malice_score(pid_t pid) {
         entry->malice_score = 0;
     }
 }
+
+// ===========================================================================
+//                              analyzer.c 함수 병합 
+// ===========================================================================
 
 /**
  * @brief 연산 내용에 따라 1회 점수를 계산 (엔트로피 비교 포함)
@@ -208,7 +261,9 @@ static int check_frequency_and_alert(ProcessMonitorEntry* entry) {
  * @param size 입력 버퍼 크기
  * @param entropy_before (WRITE용) 쓰기 전 엔트로피
  */
-static int monitor_operation(const char* operation, const char* buf, size_t size, double entropy_before) {
+static int monitor_operation(const char* operation, const char* path, const char* buf, size_t size, double entropy_before) {
+    pthread_mutex_lock(&g_lock); // 동기화 시작
+
     struct fuse_context *context = fuse_get_context();
     pid_t current_pid = context->pid;
 
@@ -219,8 +274,13 @@ static int monitor_operation(const char* operation, const char* buf, size_t size
     }
 
     // 1. 개별 연산 점수 계산 및 누적
-    int content_score = calc_score(operation, buf, size, entropy_before);
-    entry->malice_score += content_score;
+    int score_to_add = calc_score(operation, buf, size, entropy_before);
+    // 허니팟 체크
+    if (is_honeypot(path)) {
+        fprintf(stderr, "!!! HONEYPOT TOUCHED: %s by PID %d !!!\n", path, current_pid);
+        score_to_add += (FINAL_MALICE_THRESHOLD + 1); // 즉사 수준 점수 부여
+    }
+    entry->malice_score += score_to_add;
 
     // 2. 빈도수 카운트 누적
     if (strcmp(operation, "WRITE") == 0) {
@@ -232,7 +292,13 @@ static int monitor_operation(const char* operation, const char* buf, size_t size
         entry->rename_count++;
     }
 
-    // 3. 1초 윈도우 검사 및 최종 악성 여부 반환
+    // 3. 로그 기록
+    double entropy_after = calculate_entropy(buf, size);
+    log_activity(current_pid, operation, path, entropy_before, entropy_after, score_to_add, entry->malice_score);
+
+    pthread_mutex_unlock(&g_lock); // 동기화 종료
+
+    // 4. 1초 윈도우 검사 및 최종 악성 여부 반환
     return check_frequency_and_alert(entry);
 }
 
@@ -384,7 +450,7 @@ static int myfs_write(const char *path, const char *buf, size_t size, off_t offs
     }
 
     // 2. 통합 모니터링 함수 호출
-    int is_malicious = monitor_operation("WRITE", buf, size, entropy_before);
+    int is_malicious = monitor_operation("WRITE", path, buf, size, entropy_before);
     
     // 3. 악성 행위 차단
     if (is_malicious) {
@@ -424,7 +490,7 @@ static int myfs_unlink(const char *path) {
     // }
     
     // 1. 통합 모니터링 함수 호출 (엔트로피 불필요, 0 전달)
-    int is_malicious = monitor_operation("UNLINK", NULL, 0, 0);
+    int is_malicious = monitor_operation("UNLINK", NULL, NULL, 0, 0);
 
     // 2. 악성 행위 차단
     if (is_malicious) {
@@ -481,7 +547,7 @@ static int myfs_rename(const char *from, const char *to, unsigned int flags) {
     // }
     
     // 1. 통합 모니터링 함수 호출 (엔트로피 불필요, 0 전달)
-    int is_malicious = monitor_operation("RENAME", NULL, 0, 0);
+    int is_malicious = monitor_operation("RENAME", NULL, NULL, 0, 0);
 
     // 2. 악성 행위 차단
     if (is_malicious) {
@@ -550,15 +616,46 @@ int main(int argc, char *argv[]) {
     // fuse_args 구조체 초기화
     struct fuse_args args = FUSE_ARGS_INIT(argc, argv);
 
-    if (argc < 2) { // ./myfuse <target dir>
-        fprintf(stderr, "Usage: %s <mountpoint>\n", argv[0]);
+    if (args.argc < 2) {
+        fprintf(stderr, "Usage: %s [options] <mountpoint>\n", args.argv[0]);
+        fuse_opt_free_args(&args); // 메모리 해제 후 종료
         return -1;
     }
 
+    // 설정 구조체 초기화 (기본값 0: 로그 끔)
+    memset(&conf, 0, sizeof(conf));
+
+    // 인자 파싱 (FUSE가 --log를 인식하고 conf에 값을 채워줌)
+    // 파싱된 인자는 args에 남겨두고, 인식된 커스텀 인자는 처리 후 제거됨
+    if (fuse_opt_parse(&args, &conf, myfs_opts, NULL) == -1) {
+        fuse_opt_free_args(&args);
+        return 1;
+    }
+
+    fprintf(stderr, "DEBUG: args.argc = %d\n", args.argc);
+    for (int i = 0; i < args.argc; i++) {
+        fprintf(stderr, "DEBUG: args.argv[%d] = '%s'\n", i, args.argv[i]);
+    }
+
+    // 파싱 결과 적용
+    if (conf.log_enabled) {
+        set_logging_enabled(1); // Logger 켜기
+        fprintf(stderr, "INFO: Logging ENABLED (--log option detected)\n");
+    } else {
+        set_logging_enabled(0); // Logger 끄기
+        fprintf(stderr, "INFO: Logging DISABLED (Default). Use --log to enable.\n");
+    }
+
+    // 로그 파일 초기화 (켜져있을 때만 생성됨)
+    if (init_log_file() == -1 && conf.log_enabled) {
+        fprintf(stderr, "Warning: Failed to initialize log file.\n");
+    }
+
     // 마운트 포인트 경로 저장
-    char *mountpoint = realpath(argv[argc - 1], NULL);
+    char *mountpoint = realpath(args.argv[args.argc - 1], NULL);
     if (mountpoint == NULL) {
         perror("realpath");
+        fuse_opt_free_args(&args);
         return -1;
     }
 
@@ -566,6 +663,7 @@ int main(int argc, char *argv[]) {
     const char *home_dir = getenv("HOME");
     if (!home_dir) {
     	fprintf(stderr, "Error: HOME environment variable not set.\n");
+        fuse_opt_free_args(&args);
         return -1;
     }
     
@@ -578,13 +676,15 @@ int main(int argc, char *argv[]) {
     
     base_fd = open(backend_path, O_RDONLY | O_DIRECTORY);
     if (base_fd == -1) {
-	perror("Error opening backend directory");
-	return -1;
+        perror("Error opening backend directory");
+        fuse_opt_free_args(&args);
+        return -1;
     }
 
     // FUSE 파일시스템 실행
     int ret = fuse_main(args.argc, args.argv, &myfs_oper, NULL);
 
+    fuse_opt_free_args(&args);
     close(base_fd);
     return ret;
 }
