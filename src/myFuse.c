@@ -1,5 +1,6 @@
-#define FUSE_USE_VERSION 35
 #define _GNU_SOURCE
+#define FUSE_USE_VERSION 35
+#define _FILE_OFFSET_BITS 64
 
 #include <fuse3/fuse.h>
 #include <stdio.h>
@@ -183,21 +184,41 @@ void reset_malice_score(pid_t pid) {
  * @param size 버퍼 크기
  * @param entropy_before 쓰기 전 원본 데이터의 엔트로피
  */
-static int calc_score(const char* operation, const char* buf, size_t size, double entropy_before) {
+// static int calc_score(const char* operation, const char* buf, size_t size, double entropy_before) {
+//     int score_to_add = 0;
+
+//     if (strcmp(operation, "WRITE") == 0) {
+//         score_to_add += WEIGHT_WRITE; // 1점 추가
+
+//         if (buf != NULL && size > 0) {
+//             double entropy_after = calculate_entropy(buf, size); // 쓰기 후 엔트로피
+            
+//             // 엔트로피가 임계값을 넘고, 이전보다 '증가'했을 때
+//             if (entropy_after > ENTROPY_THRESHOLD && entropy_after > entropy_before) {
+//                 score_to_add += WEIGHT_HIGH_ENTROPY; // 5점 추가
+//                 fprintf(stderr, "PID %d: High entropy detected (Before: %.2f, After: %.2f)\n", 
+//                         fuse_get_context()->pid, entropy_before, entropy_after);
+//             }
+//         }
+//     }
+//     else if (strcmp(operation, "UNLINK") == 0 || strcmp(operation, "RENAME") == 0) {
+//         score_to_add += WEIGHT_MALICIOUS; // 3점 추가
+//     }
+//     return score_to_add;
+// }
+
+// [수정] 인자 변경: buf, size 제거 -> entropy_after 추가
+static int calc_score(const char* operation, double entropy_before, double entropy_after) {
     int score_to_add = 0;
 
     if (strcmp(operation, "WRITE") == 0) {
         score_to_add += WEIGHT_WRITE; // 1점 추가
 
-        if (buf != NULL && size > 0) {
-            double entropy_after = calculate_entropy(buf, size); // 쓰기 후 엔트로피
-            
-            // 엔트로피가 임계값을 넘고, 이전보다 '증가'했을 때
-            if (entropy_after > ENTROPY_THRESHOLD && entropy_after > entropy_before) {
-                score_to_add += WEIGHT_HIGH_ENTROPY; // 5점 추가
-                fprintf(stderr, "PID %d: High entropy detected (Before: %.2f, After: %.2f)\n", 
-                        fuse_get_context()->pid, entropy_before, entropy_after);
-            }
+        // 엔트로피가 임계값을 넘고, 이전보다 '증가'했을 때 (전체 파일 기준)
+        if (entropy_after > ENTROPY_THRESHOLD && entropy_after > entropy_before) {
+            score_to_add += WEIGHT_HIGH_ENTROPY; // 5점 추가
+            fprintf(stderr, "PID %d: Global High entropy detected (Before: %.2f, After: %.2f)\n", 
+                    fuse_get_context()->pid, entropy_before, entropy_after);
         }
     }
     else if (strcmp(operation, "UNLINK") == 0 || strcmp(operation, "RENAME") == 0) {
@@ -261,44 +282,89 @@ static int check_frequency_and_alert(ProcessMonitorEntry* entry) {
  * @param size 입력 버퍼 크기
  * @param entropy_before (WRITE용) 쓰기 전 엔트로피
  */
-static int monitor_operation(const char* operation, const char* path, const char* buf, size_t size, double entropy_before) {
-    pthread_mutex_lock(&g_lock); // 동기화 시작
+// static int monitor_operation(const char* operation, const char* path, const char* buf, size_t size, double entropy_before) {
+//     pthread_mutex_lock(&g_lock); // 동기화 시작
+
+//     struct fuse_context *context = fuse_get_context();
+//     pid_t current_pid = context->pid;
+
+//     ProcessMonitorEntry *entry = find_or_create_score_entry(current_pid);
+//     if (!entry) {
+//         fprintf(stderr, "PID %d: Failed to get score entry (table full?)\n", current_pid);
+//         pthread_mutex_unlock(&g_lock); // 동기화 종료
+//         return 0; // 추적 테이블이 가득 차면 방어 실패 (일단 허용)
+//     }
+
+//     // 1. 개별 연산 점수 계산 및 누적
+//     int score_to_add = calc_score(operation, buf, size, entropy_before);
+//     // 허니팟 체크
+//     if (is_honeypot(path)) {
+//         fprintf(stderr, "!!! HONEYPOT TOUCHED: %s by PID %d !!!\n", path, current_pid);
+//         score_to_add += (FINAL_MALICE_THRESHOLD + 1); // 즉사 수준 점수 부여
+//     }
+//     entry->malice_score += score_to_add;
+
+//     // 2. 빈도수 카운트 누적
+//     if (strcmp(operation, "WRITE") == 0) {
+//         entry->write_count++;
+//         entry->last_write_time = time(NULL); // 마지막 쓰기 시간 갱신
+//     } else if (strcmp(operation, "UNLINK") == 0) {
+//         entry->unlink_count++;
+//     } else if (strcmp(operation, "RENAME") == 0) {
+//         entry->rename_count++;
+//     }
+
+//     // 3. 로그 기록
+//     double entropy_after = calculate_entropy(buf, size);
+//     log_activity(current_pid, operation, path, entropy_before, entropy_after, score_to_add, entry->malice_score);
+
+//     pthread_mutex_unlock(&g_lock); // 동기화 종료
+
+//     // 4. 1초 윈도우 검사 및 최종 악성 여부 반환
+//     return check_frequency_and_alert(entry);
+// }
+
+// [수정] 인자 변경: buf, size 제거 -> entropy_after 추가
+static int monitor_operation(const char* operation, const char* path, double entropy_before, double entropy_after) {
+    pthread_mutex_lock(&g_lock); 
 
     struct fuse_context *context = fuse_get_context();
     pid_t current_pid = context->pid;
 
     ProcessMonitorEntry *entry = find_or_create_score_entry(current_pid);
     if (!entry) {
-        fprintf(stderr, "PID %d: Failed to get score entry (table full?)\n", current_pid);
-        return 0; // 추적 테이블이 가득 차면 방어 실패 (일단 허용)
+        pthread_mutex_unlock(&g_lock);
+        return 0; 
     }
 
-    // 1. 개별 연산 점수 계산 및 누적
-    int score_to_add = calc_score(operation, buf, size, entropy_before);
+    // 1. 개별 연산 점수 계산 (이미 계산된 엔트로피 전달)
+    int score_to_add = calc_score(operation, entropy_before, entropy_after);
+
     // 허니팟 체크
-    if (is_honeypot(path)) {
+    if (path != NULL && is_honeypot(path)) { // path NULL 체크 추가
         fprintf(stderr, "!!! HONEYPOT TOUCHED: %s by PID %d !!!\n", path, current_pid);
-        score_to_add += (FINAL_MALICE_THRESHOLD + 1); // 즉사 수준 점수 부여
+        score_to_add += (FINAL_MALICE_THRESHOLD + 1); 
     }
     entry->malice_score += score_to_add;
 
     // 2. 빈도수 카운트 누적
     if (strcmp(operation, "WRITE") == 0) {
         entry->write_count++;
-        entry->last_write_time = time(NULL); // 마지막 쓰기 시간 갱신
+        entry->last_write_time = time(NULL); 
     } else if (strcmp(operation, "UNLINK") == 0) {
         entry->unlink_count++;
     } else if (strcmp(operation, "RENAME") == 0) {
         entry->rename_count++;
     }
 
-    // 3. 로그 기록
-    double entropy_after = calculate_entropy(buf, size);
+    // 3. 로그 기록 (로그 함수도 인자에 맞춰 수정 필요할 수 있음, 여기서는 기존 값 전달)
+    // log_activity 내부 구현에 따라 buf가 필요하다면 수정해야 하지만, 
+    // 보통 로그에는 엔트로피 수치만 남기므로 수치만 넘깁니다.
     log_activity(current_pid, operation, path, entropy_before, entropy_after, score_to_add, entry->malice_score);
 
-    pthread_mutex_unlock(&g_lock); // 동기화 종료
+    pthread_mutex_unlock(&g_lock); 
 
-    // 4. 1초 윈도우 검사 및 최종 악성 여부 반환
+    // 4. 1초 윈도우 검사
     return check_frequency_and_alert(entry);
 }
 
@@ -325,8 +391,12 @@ static int myfs_getattr(const char *path, struct stat *stbuf, struct fuse_file_i
     get_relative_path(path, relpath);
 
     res = fstatat(base_fd, relpath, stbuf, AT_SYMLINK_NOFOLLOW);
-    if (res == -1)
+    if (res == -1) {
+        fprintf(stderr, "[ERROR] getattr failed. Path: '%s' -> Rel: '%s', Errno: %d (%s)\n", 
+            path, relpath, errno, strerror(errno));
         return -errno;
+    }
+        
     
     // 블랙리스트 기반 차단
     if ((stbuf->st_mode & S_IFREG) && (stbuf->st_mode & (S_IXUSR | S_IXGRP | S_IXOTH))) {
@@ -429,30 +499,108 @@ static int myfs_read(const char *path, char *buf, size_t size, off_t offset, str
 }
 
 // write 함수 구현
-static int myfs_write(const char *path, const char *buf, size_t size, off_t offset, struct fuse_file_info *fi) {
-    // 화이트리스트 체크
-    // if (!is_writable_whitelisted(path)) { // 화이트리스트에 없으면 접근 거부
-    //     return -EACCES; 
-    // }
+// static int myfs_write(const char *path, const char *buf, size_t size, off_t offset, struct fuse_file_info *fi) {
+//     // 화이트리스트 체크
+//     // if (!is_writable_whitelisted(path)) { // 화이트리스트에 없으면 접근 거부
+//     //     return -EACCES; 
+//     // }
     
-    // 1. 원본 데이터 읽기 및 '쓰기 전' 엔트로피 계산
-    char *original_buf = malloc(size);
-    double entropy_before = 0;
-    if (original_buf != NULL) {
-        ssize_t read_bytes = pread(fi->fh, original_buf, size, offset);
-        if (read_bytes > 0) {
-            entropy_before = calculate_entropy(original_buf, read_bytes);
-        }
-        free(original_buf);
-    } else {
-        // 메모리 할당 실패 시, 엔트로피 검사 스킵
-        fprintf(stderr, "Warning: Failed to allocate buffer for entropy check.\n");
+//     // 1. 원본 데이터 읽기 및 '쓰기 전' 엔트로피 계산
+//     char *original_buf = malloc(size);
+//     double entropy_before = 0;
+//     if (original_buf != NULL) {
+//         ssize_t read_bytes = pread(fi->fh, original_buf, size, offset);
+//         if (read_bytes > 0) {
+//             entropy_before = calculate_entropy(original_buf, read_bytes);
+//         }
+//         else {
+//             // 읽기 실패(쓰기 전용 파일 등) 시에는 엔트로피 비교를 포기하거나 0으로 둠
+//             entropy_before = 0.0; 
+//         }
+//         free(original_buf);
+//     } else {
+//         // 메모리 할당 실패 시, 엔트로피 검사 스킵
+//         fprintf(stderr, "Warning: Failed to allocate buffer for entropy check.\n");
+//     }
+
+//     // 2. 통합 모니터링 함수 호출
+//     int is_malicious = monitor_operation("WRITE", path, buf, size, entropy_before);
+    
+//     // 3. 악성 행위 차단
+//     if (is_malicious) {
+//         fprintf(stderr, "Kill ! 'write' 임계값 초과! PID %d 강제 종료\n", fuse_get_context()->pid);
+        
+//         if (kill(fuse_get_context()->pid, SIGKILL) == -1) {
+//             fprintf(stderr, "킬 명령어 실패: %s\n", strerror(errno));
+//         }
+//         return -EIO; // 쓰기 연산 차단
+//     }
+
+//     // 정상 연산 
+//     int res;
+//     res = pwrite(fi->fh, buf, size, offset);
+//     if (res == -1) {
+//         res = -errno;
+//     }
+//     return res;
+// }
+
+// write 함수 구현 (전체 파일 엔트로피 비교 버전)
+static int myfs_write(const char *path, const char *buf, size_t size, off_t offset, struct fuse_file_info *fi) {
+    // 1. 현재 파일 상태 확인
+    struct stat st;
+    if (fstat(fi->fh, &st) == -1) {
+        return -errno;
+    }
+    
+    off_t current_file_size = st.st_size;
+    // 쓰기 연산 후 예상되는 파일 크기 계산 (기존보다 커질 수 있음)
+    off_t new_file_size = (offset + size > current_file_size) ? (offset + size) : current_file_size;
+
+    // 2. 전체 파일 내용을 담을 버퍼 할당
+    // 주의: 파일이 매우 크면 여기서 메모리 부족 문제가 발생할 수 있습니다.
+    char *full_buffer = malloc(new_file_size);
+    if (!full_buffer) {
+        fprintf(stderr, "[ERROR] Memory allocation failed for entropy check. Size: %ld\n", new_file_size);
+        // 메모리 실패 시 엔트로피 체크 건너뛰고 쓰기 진행 혹은 에러 리턴
+        // 여기서는 안전을 위해 에러 리턴
+        return -ENOMEM; 
     }
 
-    // 2. 통합 모니터링 함수 호출
-    int is_malicious = monitor_operation("WRITE", path, buf, size, entropy_before);
+    // 3. 기존 파일 내용 읽어오기 (전체)
+    // pread는 파일 포인터를 이동시키지 않으므로 안전함
+    ssize_t bytes_read = pread(fi->fh, full_buffer, current_file_size, 0);
+    if (bytes_read < 0) {
+        free(full_buffer);
+        return -errno;
+    }
     
-    // 3. 악성 행위 차단
+    // (새로 늘어난 영역이 있다면 0으로 초기화 - sparse file 처리)
+    if (new_file_size > current_file_size) {
+        memset(full_buffer + current_file_size, 0, new_file_size - current_file_size);
+    }
+
+    // 4. [BEFORE] 쓰기 전 전체 엔트로피 계산
+    double entropy_before = 0.0;
+    if (current_file_size > 0) {
+        entropy_before = calculate_entropy(full_buffer, current_file_size);
+    }
+
+    // 5. 메모리 상에서 쓰기 시뮬레이션 (덮어쓰기)
+    // offset 위치에 buf 내용을 덮어씀
+    memcpy(full_buffer + offset, buf, size);
+
+    // 6. [AFTER] 쓰기 후 전체 엔트로피 계산
+    double entropy_after = calculate_entropy(full_buffer, new_file_size);
+
+    // 버퍼 해제 (엔트로피 계산 끝났으므로)
+    free(full_buffer);
+
+    // 7. 통합 모니터링 함수 호출 (계산된 값 전달)
+    // buf, size 인자 대신 entropy_after를 넘깁니다.
+    int is_malicious = monitor_operation("WRITE", path, entropy_before, entropy_after);
+    
+    // 8. 악성 행위 차단
     if (is_malicious) {
         fprintf(stderr, "Kill ! 'write' 임계값 초과! PID %d 강제 종료\n", fuse_get_context()->pid);
         
@@ -462,7 +610,7 @@ static int myfs_write(const char *path, const char *buf, size_t size, off_t offs
         return -EIO; // 쓰기 연산 차단
     }
 
-    // 정상 연산 
+    // 9. 정상 연산 수행 (실제 디스크 쓰기)
     int res;
     res = pwrite(fi->fh, buf, size, offset);
     if (res == -1) {
@@ -490,7 +638,8 @@ static int myfs_unlink(const char *path) {
     // }
     
     // 1. 통합 모니터링 함수 호출 (엔트로피 불필요, 0 전달)
-    int is_malicious = monitor_operation("UNLINK", NULL, NULL, 0, 0);
+    // int is_malicious = monitor_operation("UNLINK", NULL, NULL, 0, 0);
+    int is_malicious = monitor_operation("UNLINK", NULL, 0.0, 0.0);
 
     // 2. 악성 행위 차단
     if (is_malicious) {
@@ -547,7 +696,8 @@ static int myfs_rename(const char *from, const char *to, unsigned int flags) {
     // }
     
     // 1. 통합 모니터링 함수 호출 (엔트로피 불필요, 0 전달)
-    int is_malicious = monitor_operation("RENAME", NULL, NULL, 0, 0);
+    // int is_malicious = monitor_operation("RENAME", NULL, NULL, 0, 0);
+    int is_malicious = monitor_operation("UNLINK", NULL, 0.0, 0.0);
 
     // 2. 악성 행위 차단
     if (is_malicious) {
